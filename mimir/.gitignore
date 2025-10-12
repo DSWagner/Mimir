@@ -1,0 +1,32 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# VSCode / IDE settings
+.vscode/
+.idea/
+
+# Logs and runtime artifacts
+*.log
+*.tmp
+
+# Private or sensitive files
+private_keys.json
+
+# OS junk files
+.DS_Store
+Thumbs.db
+
+# PyInstaller / build artifacts
+build/
+dist/
+*.spec
