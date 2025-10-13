@@ -30,3 +30,7 @@ Thumbs.db
 build/
 dist/
 *.spec
+
+
+# Secrets
+.env
