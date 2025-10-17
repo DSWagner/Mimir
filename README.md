@@ -1,172 +1,190 @@
-# Mimir MCP Agent — Local Setup Guide
+# Mimir MCP Agent — Local, MCP‑First CLI
 
-This repo wires up a local **uAgents**-based agent that talks to the **Blockscout MCP server** and uses **ASI:One** to (1) pick the right MCP tool and (2) prettify raw results into concise, human‑readable Markdown.
+This project is a **local command‑line agent** that uses a **Blockscout MCP server** (JSON‑RPC over HTTP) to fetch on‑chain data and an **ASI:One model** to reason about which tools to call and how to synthesize a final answer.
 
-> TL;DR: You’ll run a Dockerized MCP server on port **8001**, start the Python agent on port **8000**, then send prompts via a simple REST call.
+It **does not** expose an HTTP API, and it **does not** use uAgents. You run a Dockerized **Blockscout MCP server**, then run the **Python CLI** and pass your question directly:
+
+```bash
+python agent.py "What is the address of vitalik.eth?"
+```
 
 ---
 
-## 🧱 Architecture (high level)
+## 🧱 Architecture (truthful)
 
-- **Blockscout MCP Server (Docker)** → exposes blockchain tools over REST (we’ll use `GET /v1/...` endpoints)
-- **Agent (Python/uAgents)** → receives your prompts, asks **ASI:One** which tool to call, executes it on the MCP server, then pretty‑formats the result
-- **You (PowerShell)** → send a prompt to `http://127.0.0.1:8000/chat`
+- **Blockscout MCP Server (Docker)** — serves **MCP JSON‑RPC** at `/mcp` (and optionally `/v1/...` REST if you enable `--rest`).
+- **Agent (Python CLI)** — sends prompts to **ASI:One**, lets the model decide the tool sequence, executes **MCP `tools/call`**, feeds results back, and prints a **clean final answer**.
+- **No REST endpoint from the agent**. It’s a CLI only.
 
-Ports:
+### Why results are clean
 
-- MCP server → **8001** (container `8000` mapped to host `8001`)
-- Agent → **8000**
+The agent implements **hardened output control**:
 
-> ⚠️ **Important:** Keep **8001** for the MCP server to avoid clashing with the agent’s port (**8000**).
+- The model is asked to end the final answer with a sentinel `<<<END>>>`.
+- A **sanitizer** trims at the sentinel and rejects known “garbage” signatures (e.g., random particle system dumps, editor configs).
+- If garbage is detected, it reprompts once for a concise, clean answer.
+- Logging shows **short “thinking” summaries** of each step instead of raw dumps.
 
 ---
 
 ## ✅ Prerequisites
 
-- **Windows** + **PowerShell** (examples use PS)
-- **Docker** installed and running
-- **Python 3.10+** with **venv**
-- An **ASI API key** (for ASI:One) — this is required for tool selection & pretty summaries
+- **Docker** installed and running.
+- **Python 3.10+** with **venv**.
+- An **ASI:One API key** (environment variable `ASI_ONE_API_KEY`).
+
+Minimal Python deps:
+
+- `requests`
+- `python-dotenv`
+
+Install via:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+(Or install those two packages manually.)
 
 ---
 
-## 1) Clone the repo
+## 🔧 Environment
 
-```powershell
-git clone <your-repo-url> mimir
-cd .\mimir
+Create `.env` in the project root with:
+
+```
+ASI_ONE_API_KEY=sk-your-asi-key
+# Optional override (defaults shown below)
+BLOCKSCOUT_MCP_URL=http://localhost:8001/mcp
 ```
 
-> The rest of the steps assume your current directory is the repo root (`.\mimir`).
+> The model name is set **inside `agent.py`** (`ASI_MODEL="asi1-extended"` in the current file). Change it there if you prefer `asi1-mini`.
 
 ---
 
-## 2) Create & activate a virtual environment **inside `./mimir/`**
+## ▶️ Run the Blockscout MCP server
 
-```powershell
-# From .\mimir
-py -m venv .\venv
-.\venv\Scripts\Activate.ps1
+Start the official container in **HTTP MCP** mode on host port **8001**:
+
+```bash
+docker run --rm -p 8001:8000 ghcr.io/blockscout/mcp-server:latest \
+  python -m blockscout_mcp_server --http --rest --http-host 0.0.0.0 --http-port 8000
 ```
 
-Your prompt should now display `(venv)` at the beginning.
+- MCP JSON‑RPC endpoint will be at: `http://localhost:8001/mcp`
+- `/v1/...` REST endpoints are also enabled by `--rest`, but **the agent talks to `/mcp`**.
+
+Leave this terminal **running**.
 
 ---
 
-## 3) Install Python dependencies
+## ▶️ Run the agent
 
-We’ll install from the provided requirements file located at `./mimir/requirements.txt`:
+In another terminal (with your virtualenv active):
 
-```powershell
-(venv) PS .\mimir> python -m pip install -r .\mimir\requirements.txt
-```
-
-If you’re already inside the `mimir` folder, you can also use:
-
-```powershell
-(venv) PS .\mimir> python -m pip install -r .\requirements.txt
-```
-
-> Tip: A minimal dependency set for this project is typically: `uagents`, `requests`, `python-dotenv`.
-
----
-
-## 4) Configure your `.env`
-
-Create a file named `.env` in the repo root (`.\mimir\.env`) with your ASI key:
-
-```
-ASI_API_KEY=your_asi_api_key_here
-# Optional override (default is asi1-mini)
-ASI_MODEL=asi1-mini
-# MCP base URL (defaults to http://localhost:8001)
-MCP_BASE_URL=http://localhost:8001
-```
-
-The agent loads this automatically (via `python-dotenv`).
-
----
-
-## 5) Start the Blockscout MCP server (Docker)
-
-Open a **new** PowerShell terminal (e.g., in Cursor IDE) and run:
-
-```powershell
-docker run --rm -p 8001:8000 ghcr.io/blockscout/mcp-server:latest python -m blockscout_mcp_server --http --rest --http-host 0.0.0.0
-```
-
-- Leave the **first port as 8001** (host:container is `8001:8000`) so it **doesn’t collide** with the agent (which runs on **8000**).
-- You can sanity-check it with:
-  ```powershell
-  Invoke-RestMethod http://localhost:8001/v1/tools -Method GET | ConvertTo-Json -Depth 4
-  ```
-
-Leave this terminal **open** — the server must keep running.
-
----
-
-## 6) Start the Agent
-
-Back in your **venv terminal** (the one with `(venv)` in the prompt):
-
-```powershell
-(venv) PS .\mimir> python .\agent.py
+```bash
+python agent.py "What is the address of vitalik.eth?"
 ```
 
 You should see logs like:
 
 ```
-[blockscout_mcp_agent]: Starting server on http://0.0.0.0:8000
-[blockscout_mcp_agent]: Manifest published successfully: chat
-[asi_orchestrator] ✅ ASI_API_KEY loaded from .env
+✅ MCP connected at http://localhost:8001/mcp. 18 tools available.
+[thinking] received the request and prepared the tool environment
+
+--- Step 1 ---
+[thinking] deciding whether to call a tool or answer directly
+[thinking] chose tool: get_address_by_ens_name — purpose: resolve ENS name to address
+[thinking] with parameters: {"name":"vitalik.eth"}
+[thinking] tool executed; resolved address = 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
+
+[answer]
+0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
 ```
 
-> The agent automatically performs a one‑time “unlock” call if the MCP server requires it.
+The agent prints:
+
+- **thinking**: short, readable step summaries (tool chosen, why, and high‑level result).
+- **answer**: the clean final answer (sanitized; no random noise).
 
 ---
 
-## 7) Send a test prompt
+## 🛠️ How it works (accurate)
 
-In **another** PowerShell terminal (while both the Docker container and the agent are running), send a prompt to the agent:
+- Discovers available tools with `tools/list` from the MCP server on startup.
+- Lets the LLM decide **if** and **which** tool to call. The agent does **not** hardcode keyword triggers.
+- Accepts multiple JSON shapes from the LLM:
+  - `{"tool":"...", "params": {...}}`
+  - `{"tool":"...", "arguments": {...}}`
+  - `{"name":"...", "params": {...}}`
+  - `{"name":"...", "arguments": {...}}`
+- Normalizes common parameter aliases (e.g., `ens_name → name` for `get_address_by_ens_name`).
+- Calls `tools/call` over MCP JSON‑RPC and hands the result back to the model to decide next steps.
+- Final answers are requested with a sentinel and sanitized before display.
 
-```powershell
-$body = @{ text = "What is the balance on address 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045 on Ethereum chain?" } | ConvertTo-Json
-Invoke-RestMethod -Uri "http://127.0.0.1:8000/chat" -Method POST -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 8
+**No raw chain‑of‑thought is printed.** The “thinking” lines are curated, high‑level summaries only.
+
+---
+
+## 🔬 Example commands you can run
+
+```bash
+# Simple ENS → address
+python agent.py "What is the address of vitalik.eth?"
+
+# NFTs with pagination
+python agent.py "For punk6529.eth, get all NFTs held on Ethereum and summarize totals per collection."
+
+# Transaction forensics
+python agent.py "Analyze tx 0xf8a55721f7e2dcf85690aaf81519f7bc820bc58a878fa5f81b12aef5ccda0efb on Base (8453): decode input, summarize transfers and fees."
+
+# Token symbol discovery + balances
+python agent.py "On Optimism (10), find the OP token contract, then for barnbridge.eth list current balance and allowances."
 ```
 
-You should receive a human‑friendly Markdown summary (the agent uses ASI to format the raw JSON).
+For a longer test suite, see the “complex prompts” in your history; the agent supports multi‑step plans (resolve ENS → fetch transfers → aggregate, etc.).
 
 ---
 
-## 🔍 Troubleshooting
+## 🚑 Troubleshooting
 
-- **`ASI_API_KEY is not set`**  
-  Ensure `.env` exists in the repo root and contains your key. Restart the agent after adding it.
+**MCP `tools/list` 406 / 404**  
+Make sure you are calling the MCP endpoint (`/mcp`) and sending:
 
-- **`404 Not Found for url: https://api.asi1.ai/v1/chat/completions`**  
-  Check that your model name is `asi1-mini` (with the `1`). You can set `ASI_MODEL=asi1-mini` in `.env`.
+```
+Content-Type: application/json
+Accept: application/json, text/event-stream
+```
 
-- **`404 Not Found` on `/tools/call`**  
-  Your MCP build uses **per‑tool GET endpoints** (`/v1/get_address_info?…`) and **not** `POST /v1/tools/call`. The client code already handles this automatically.
+The agent already sets these headers. Use the Docker command above.
 
-- **Port conflicts**  
-  Keep MCP on **8001** and the agent on **8000** as shown above.
+**Read timeouts from ASI**  
+The agent uses `(connect=10s, read=45s)` timeouts. Network hiccups can cause read timeouts; just rerun the command. You can tweak timeouts in `agent.py` (`ASI_CONNECT_TIMEOUT` / `ASI_READ_TIMEOUT`).
 
-- **Verify MCP server is reachable**
-  ```powershell
-  Invoke-RestMethod http://localhost:8001/v1/tools -Method GET
-  ```
+**Random “particle.png/timeline” garbage in the output**  
+The sanitizer will reject and reprompt. If you still see noise, update the `GARBAGE_PATTERNS` in `agent.py` with the new signature and rerun.
+
+**PowerShell `curl` issues**  
+On Windows, prefer `Invoke-WebRequest`/`Invoke-RestMethod` for testing endpoints, or use `curl.exe` explicitly. The agent itself does **not** require curl; it’s a CLI.
+
+**Change model**  
+Edit `ASI_MODEL` in `agent.py` (default in this repo is `asi1-extended`).
+
+**Point to a public MCP**  
+Set `BLOCKSCOUT_MCP_URL` in `.env` to the desired MCP JSON‑RPC endpoint (must speak MCP JSON‑RPC at `/mcp`).
 
 ---
 
-## 🧯 Notes
+## 📁 Project layout (key files)
 
-- The agent exposes a REST route at `POST /chat` that accepts `{ "text": "..." }` and returns `{ "text": "..." }`.
-- The agent discovers MCP tools, orchestrates tool selection via ASI, and pretty‑formats results. It also auto‑calls the unlock tool once per run where required.
-- This setup is **local‑first** — nothing is deployed publicly unless you choose to.
+```
+agent.py          # The MCP-first CLI agent with hardened output control + think logs
+requirements.txt  # Minimal Python dependencies
+.env              # Your ASI_ONE_API_KEY and optional BLOCKSCOUT_MCP_URL
+```
 
 ---
 
 ## 📄 License
 
-MIT (or your preferred license). Update this section to match your project.
+MIT (or your preferred license).
