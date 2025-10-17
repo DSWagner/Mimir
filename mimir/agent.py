@@ -1,161 +1,445 @@
-import os
+#!/usr/bin/env python3
+"""
+MCP-first agent with HARDENED OUTPUT CONTROL + THINK LOGS (no raw dumps).
+
+What this file does:
+- Lets the LLM decide when/which MCP tools to call (no keyword forcing).
+- Executes Blockscout MCP JSON-RPC tool calls and feeds results back to the LLM.
+- Strong guardrails to keep final answers clean (sentinel, sanitizer, SSE watchdog).
+- Replaces raw message dumps with concise, high-level THINK LOGS you can show to users.
+
+Important policy note:
+- We DO NOT print the model's literal chain-of-thought or raw responses.
+- Instead we print brief summaries of each step that describe what happened
+  (e.g., which tool was chosen and why at a high level) without exposing internal reasoning text.
+"""
+
 import json
-from typing import Dict, Any, Optional, List
+import os
+import re
+import sys
+import time
+import uuid
+from typing import Any, Dict, List, Optional
 
-from uagents import Agent, Context, Protocol, Model
+import requests
+from dotenv import load_dotenv
 
-from mcp_client import MCPClient
-from asi_orchestrator import choose_tool_with_asi, pretty_format_result
+load_dotenv()
 
-# --------------------------------------------------------------------------------------
+# -----------------------------
 # Config
-# --------------------------------------------------------------------------------------
-AGENT_SEED = os.getenv("AGENT_SEED", "blockscout-mcp-auto-seed")
-# IMPORTANT: this should point to your Dockerized MCP server (you mapped 8001:8000)
-MCP_BASE_URL = os.getenv("MCP_BASE_URL", "http://localhost:8001")
+# -----------------------------
+ASI_API_KEY = os.getenv("ASI_ONE_API_KEY", "sk-REPLACE_ME")
+ASI_ENDPOINT = "https://api.asi1.ai/v1/chat/completions"
+ASI_MODEL = "asi1-extended"   # your preferred fast model
+ASI_CONNECT_TIMEOUT = 10
+ASI_READ_TIMEOUT = 45
+ASI_TIMEOUT = (ASI_CONNECT_TIMEOUT, ASI_READ_TIMEOUT)
 
-# --------------------------------------------------------------------------------------
-# Protocol models
-# --------------------------------------------------------------------------------------
-class ChatMessage(Model):
-    text: str  # user message
+MCP_URL = os.getenv("BLOCKSCOUT_MCP_URL", "http://localhost:8001/mcp")
+MCP_TIMEOUT = 60
+MAX_TOOL_STEPS = 12
 
-class ChatResponse(Model):
-    text: str  # agent reply
+FINAL_SENTINEL = "<<<END>>>"
 
-# REST models (for a simple REST endpoint that mirrors the chat protocol)
-class RestIn(Model):
-    text: str
+SESSION_MAP: Dict[str, str] = {}
 
-class RestOut(Model):
-    text: str
+# -----------------------------
+# Think-log helpers (safe summaries)
+# -----------------------------
+def think(msg: str) -> None:
+    """Print a concise, user-friendly reasoning summary (not raw model output)."""
+    print(f"[thinking] {msg}")
 
-# --------------------------------------------------------------------------------------
-# Agent + MCP client
-# --------------------------------------------------------------------------------------
-chat = Protocol(name="chat", version="1.0")
-agent = Agent(name="blockscout_mcp_agent", seed=AGENT_SEED)
-mcp = MCPClient(base_url=MCP_BASE_URL)
+def step_header(i: int) -> None:
+    print(f"\n--- Step {i} ---")
 
-_cached_asi_tools: Optional[List[Dict[str, Any]]] = None
-_unlock_done: bool = False  # <--- global flag instead of ctx.state
+def summarize_tool_purpose(name: str) -> str:
+    """High-level purpose line per tool (for clean logs)."""
+    purposes = {
+        "__unlock_blockchain_analysis__": "initialize server guidance",
+        "get_chains_list": "list supported chains",
+        "get_address_by_ens_name": "resolve ENS name to address",
+        "lookup_token_by_symbol": "find token addresses by symbol/name",
+        "get_contract_abi": "fetch a contract ABI",
+        "inspect_contract_code": "fetch verified contract source files",
+        "get_address_info": "summarize address balances/tags/contracts",
+        "get_tokens_by_address": "list ERC-20 holdings for an address",
+        "get_latest_block": "fetch latest indexed block",
+        "get_transactions_by_address": "list transactions in a time window",
+        "get_token_transfers_by_address": "list ERC-20 transfers in a time window",
+        "transaction_summary": "get human-readable tx summary",
+        "nft_tokens_by_address": "list NFTs owned by an address",
+        "get_block_info": "get detailed block info",
+        "get_transaction_info": "get detailed transaction info",
+        "get_transaction_logs": "get logs/events for a tx",
+        "read_contract": "read a contract function",
+        "direct_api_call": "call curated raw Blockscout endpoint",
+    }
+    return purposes.get(name, "perform on-chain lookup")
 
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
-def _mcp_to_asi_tools(mcp_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def summarize_tool_result(tool: str, payload: Dict[str, Any]) -> str:
+    """Short, safe result summary (avoid raw dump)."""
+    if not isinstance(payload, dict):
+        return "received non-JSON response"
+
+    if payload.get("error"):
+        return "tool returned an error"
+
+    # Common structured result field:
+    data = payload.get("data")
+
+    if tool == "get_address_by_ens_name" and isinstance(data, dict):
+        addr = data.get("resolved_address")
+        return f"resolved address = {addr}" if addr else "no address found"
+
+    if tool == "get_latest_block" and isinstance(data, dict):
+        number = data.get("number") or data.get("latest_block") or data.get("height")
+        ts = data.get("timestamp")
+        base = f"latest block = {number}" if number is not None else "latest block unknown"
+        return f"{base}; timestamp = {ts}" if ts is not None else base
+
+    if tool in ("get_tokens_by_address", "nft_tokens_by_address"):
+        # Often paginated. We avoid listing all items; just count.
+        count = None
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("tokens")
+            if isinstance(items, list):
+                count = len(items)
+        return f"received {count if count is not None else 'some'} items"
+
+    if tool in ("get_transactions_by_address", "get_token_transfers_by_address"):
+        count = None
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("transactions") or data.get("transfers")
+            if isinstance(items, list):
+                count = len(items)
+        return f"received {count if count is not None else 'some'} records"
+
+    # Default: mention top-level keys only
+    keys = ", ".join(list(payload.keys())[:6])
+    return f"ok; keys: {keys}" if keys else "ok"
+
+# -----------------------------
+# Session handling
+# -----------------------------
+def get_session_id(conv_id: str) -> str:
+    sid = SESSION_MAP.get(conv_id)
+    if sid is None:
+        sid = str(uuid.uuid4())
+        SESSION_MAP[conv_id] = sid
+    return sid
+
+# -----------------------------
+# LLM chat
+# -----------------------------
+def asi_chat(messages: List[Dict[str, str]], *, stream: bool = False) -> str:
+    """LLM request helper. Finals are non-stream; tool-iteration is also non-stream here."""
+    headers = {
+        "Authorization": f"Bearer {ASI_API_KEY}",
+        "x-session-id": get_session_id("default"),
+        "Content-Type": "application/json",
+    }
+    payload = {"model": ASI_MODEL, "messages": messages, "stream": stream}
+
+    r = requests.post(ASI_ENDPOINT, headers=headers, json=payload, timeout=ASI_TIMEOUT)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+# -----------------------------
+# MCP JSON-RPC client
+# -----------------------------
+class McpClient:
+    def __init__(self, url: str, timeout: int = 60):
+        self.url = url
+        self.timeout = timeout
+        self._id = 0
+        self._headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Cache-Control": "no-store",
+            "User-Agent": "Mimir-MCP-Agent/2.1",
+        }
+
+    def _next_id(self) -> int:
+        self._id += 1
+        return self._id
+
+    def _parse_sse(self, resp: requests.Response) -> Dict[str, Any]:
+        last_obj: Optional[Dict[str, Any]] = None
+        IDLE_MAX = 15
+        last_activity = time.time()
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if line:
+                last_activity = time.time()
+            if time.time() - last_activity > IDLE_MAX:
+                break
+            if not line:
+                continue
+            if line.startswith(":") or line.startswith("event:"):
+                continue
+            if line.startswith("data:"):
+                data = line[len("data:"):].strip()
+                if not data:
+                    continue
+                try:
+                    obj = json.loads(data)
+                    last_obj = obj
+                    if isinstance(obj, dict) and ("result" in obj or "error" in obj):
+                        break
+                except Exception:
+                    continue
+
+        if last_obj is None:
+            raise RuntimeError("Empty SSE stream from MCP server")
+        if isinstance(last_obj, dict) and last_obj.get("error"):
+            raise RuntimeError(f"MCP error: {last_obj['error']}")
+        if isinstance(last_obj, dict) and "result" in last_obj:
+            return last_obj["result"]
+        return last_obj
+
+    def rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params or {}}
+        with requests.post(self.url, headers=self._headers, json=payload, timeout=self.timeout, stream=True) as resp:
+            resp.raise_for_status()
+            ctype = resp.headers.get("Content-Type", "")
+            if "text.event-stream" in ctype or "text/event-stream" in ctype:
+                return self._parse_sse(resp)
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"MCP rpc error: {data['error']}")
+            return data.get("result", {}) if isinstance(data, dict) else {}
+
+    def tools_list(self) -> List[Dict[str, Any]]:
+        result = self.rpc("tools/list", {})
+        tools = result.get("tools", [])
+        return tools if isinstance(tools, list) else []
+
+    def tools_call(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        return self.rpc("tools/call", {"name": name, "arguments": arguments})
+
+mcp = McpClient(MCP_URL, MCP_TIMEOUT)
+
+# Discover tools (for display/validation only)
+try:
+    meta = mcp.tools_list()
+    AVAILABLE_TOOLS = [t["name"] for t in meta if isinstance(t, dict) and "name" in t]
+    print(f"✅ MCP connected at {MCP_URL}. {len(AVAILABLE_TOOLS)} tools available.")
+except Exception as e:
+    print(f"⚠️ tools/list failed: {e}")
+    AVAILABLE_TOOLS = []
+
+# -----------------------------
+# Tool-call parsing & normalization
+# -----------------------------
+def _normalize_toolcall_object(obj: Any) -> Optional[Dict[str, Any]]:
     """
-    Convert MCP tool descriptions to ASI tool schemas:
-    MCP uses e.g. {name, description, input_schema, ...}
-    ASI expects {name, description, parameters}
+    Accepts:
+      {"tool": "...", "params": {...}}
+      {"tool": "...", "arguments": {...}}
+      {"name": "...", "params": {...}}
+      {"name": "...", "arguments": {...}}
+    -> returns {"tool": name, "params": params}
     """
-    asi_tools: List[Dict[str, Any]] = []
-    for t in mcp_tools:
-        name = t.get("name")
-        if not name:
-            continue
-        asi_tools.append({
-            "name": name,
-            "description": t.get("description", ""),
-            "parameters": t.get("input_schema", {"type": "object", "properties": {}})
-        })
-    return asi_tools
+    if not isinstance(obj, dict):
+        return None
 
+    tool_name = None
+    params = None
 
-def _ensure_unlock(ctx: Context):
-    """Call the unlock tool once per process (safe no-op if not required)."""
-    global _unlock_done
-    if _unlock_done:
-        return
+    if "tool" in obj:
+        tool_name = obj["tool"]
+    elif "name" in obj:
+        tool_name = obj["name"]
+
+    if "params" in obj and isinstance(obj["params"], dict):
+        params = obj["params"]
+    elif "arguments" in obj and isinstance(obj["arguments"], dict):
+        params = obj["arguments"]
+
+    if tool_name and isinstance(params, dict):
+        return {"tool": tool_name, "params": params}
+
+    return None
+
+def maybe_extract_tool_call(text: str) -> Optional[Dict[str, Any]]:
+    # Try direct JSON first
     try:
-        mcp.call_tool("__unlock_blockchain_analysis__", {})
-        ctx.logger.info("Unlock tool executed.")
-    except Exception as e:
-        ctx.logger.warning(f"Unlock tool failed or not required: {e}")
-    finally:
-        _unlock_done = True
+        obj = json.loads(text)
+        call = _normalize_toolcall_object(obj)
+        if call:
+            return call
+    except Exception:
+        pass
 
-
-def _mcp_chat_flow(ctx: Context, prompt: str) -> str:
-    """
-    Shared logic used by both the chat protocol handler and the REST endpoint:
-    - Discover MCP tools (cached)
-    - (Optional) Unlock
-    - Ask ASI to choose the best tool + args
-    - Call the MCP tool
-    - Pretty-format the result with ASI
-    """
-    global _cached_asi_tools
-
-    # 1) Discover tools once (cached)
-    if _cached_asi_tools is None:
-        mcp_tools = mcp.list_tools()
-        _cached_asi_tools = _mcp_to_asi_tools(mcp_tools)
-        ctx.logger.info(f"Discovered {len(_cached_asi_tools)} MCP tools.")
-
-    # 2) Ensure unlock has been attempted
-    _ensure_unlock(ctx)
-
-    # 3) Ask ASI which tool to call
-    choice = choose_tool_with_asi(prompt, _cached_asi_tools)
-    name, args = choice.get("name"), choice.get("arguments", {})
-
-    if not name:
-        return "I couldn't pick a suitable tool for that request."
-
-    # 4) If ASI returned arguments as a JSON-encoded string, try to parse
-    if isinstance(args, str):
+    # Fallback: find first JSON block
+    s, e = text.find("{"), text.rfind("}")
+    if s != -1 and e > s:
         try:
-            args = json.loads(args)
+            snippet = text[s:e + 1]
+            obj2 = json.loads(snippet)
+            call = _normalize_toolcall_object(obj2)
+            if call:
+                return call
         except Exception:
             pass
 
-    # 5) Call MCP tool
-    result = mcp.call_tool(name, args)
+    return None
 
-    # 6) Pretty-format via ASI (fallback to compact JSON if anything fails)
-    try:
-        pretty = pretty_format_result(
-            user_prompt=prompt,
-            tool_name=name,
-            tool_args=args,
-            raw_result=result
-        )
-        return pretty
-    except Exception as e:
-        ctx.logger.warning(f"Pretty formatting failed, returning raw preview: {e}")
-        result_json = json.dumps(result, ensure_ascii=False)
-        return f"{name}({args}) → {result_json[:1600]}" + ("…" if len(result_json) > 1600 else "")
+def normalize_params(tool: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Surgical normalization (no user-prompt inference)."""
+    p = dict(params or {})
 
-# --------------------------------------------------------------------------------------
-# Chat protocol handler
-# --------------------------------------------------------------------------------------
-@chat.on_message(model=ChatMessage, replies=ChatResponse)
-async def handle(ctx: Context, sender: str, msg: ChatMessage):
-    ctx.logger.info(f"User: {msg.text}")
-    try:
-        text = _mcp_chat_flow(ctx, msg.text)
-        await ctx.send(sender, ChatResponse(text=text))
-    except Exception as e:
-        await ctx.send(sender, ChatResponse(text=f"Error: {e}"))
+    # get_address_by_ens_name expects {"name": "<ens>"}
+    if tool == "get_address_by_ens_name":
+        for alias in ("ens_name", "domain", "ens", "ensName"):
+            if alias in p and "name" not in p:
+                p["name"] = p.pop(alias)
 
-# --------------------------------------------------------------------------------------
-# Simple REST endpoint to send prompts without uAgents wire format
-# POST /chat  { "text": "your question" }  -> { "text": "agent reply" }
-# --------------------------------------------------------------------------------------
-@agent.on_rest_post("/chat", RestIn, RestOut)
-async def rest_chat(ctx: Context, req: RestIn) -> RestOut:
-    ctx.logger.info(f"[REST] User: {req.text}")
-    try:
-        text = _mcp_chat_flow(ctx, req.text)
-        return RestOut(text=text)
-    except Exception as e:
-        return RestOut(text=f"Error: {e}")
+    # read_contract sanity aliases
+    if tool == "read_contract":
+        if "fn" in p and "function_name" not in p:
+            p["function_name"] = p.pop("fn")
+        if "arguments" in p and "args" not in p and isinstance(p["arguments"], (list, tuple)):
+            p["args"] = p.pop("arguments")
 
-# --------------------------------------------------------------------------------------
-# Manifest + run
-# --------------------------------------------------------------------------------------
-agent.include(chat, publish_manifest=True)
+    return p
 
+# -----------------------------
+# Final answer hygiene
+# -----------------------------
+GARBAGE_PATTERNS = [
+    r"\bparticle\.png\b",
+    r"\bSpawn Shape\b",
+    r"\bTint\b\s*-\s*",
+    r"\bTransparency\b\s*-\s*",
+    r"\bEmission\b\s*-\s*",
+    r"\bRotation\b\s*-\s*",
+    r"\bVelocity\b\s*-\s*",
+    r"\btimelineCount\b",
+    r"\bcolors\d+\b",
+    r"\bscaling\d+\b",
+]
+GARBAGE_RE = re.compile("|".join(GARBAGE_PATTERNS), re.IGNORECASE | re.MULTILINE)
+
+def sanitize_final(text: str) -> Optional[str]:
+    """Cut at sentinel; reject if known garbage present; return clean final string or None to reprompt."""
+    if FINAL_SENTINEL in text:
+        text = text.split(FINAL_SENTINEL, 1)[0]
+
+    text = text.strip().strip("`").strip()
+
+    if GARBAGE_RE.search(text or ""):
+        return None
+
+    MAX_CHARS = 12000
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS] + " …"
+
+    return text if text else None
+
+FINAL_INSTRUCTION = (
+    "Now produce ONLY the final user-facing answer, no analysis, no code fences, "
+    f"and END with the token {FINAL_SENTINEL}. Do not add anything after the sentinel."
+)
+
+# -----------------------------
+# System prompt
+# -----------------------------
+SYSTEM_PROMPT = (
+    f"You are a blockchain expert. You can call Blockscout MCP tools via JSON-RPC at {MCP_URL}.\n"
+    "Use your judgment to decide when tool calls are needed and which tools to use.\n"
+    "When you choose to call a tool, output exactly ONE JSON object (no prose) with keys `tool` and `params`.\n"
+    "Example: {\"tool\":\"get_address_by_ens_name\",\"params\":{\"name\":\"vitalik.eth\"}}\n"
+    "After a tool result is returned to you, continue reasoning and decide the next step (another tool call or a final answer).\n"
+    "Do not mention or rely on any external agent marketplace; focus on the Blockscout MCP tools only.\n"
+    "When delivering the FINAL ANSWER, end your message with the exact token "
+    f"{FINAL_SENTINEL}\n"
+    "Available tools: " + ", ".join(AVAILABLE_TOOLS) + "\n"
+)
+
+# -----------------------------
+# Main loop
+# -----------------------------
+def run(user_prompt: str) -> None:
+    think("received the request and prepared the tool environment")
+    conv: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    for step in range(1, MAX_TOOL_STEPS + 1):
+        step_header(step)
+        think("deciding whether to call a tool or answer directly")
+        reply = asi_chat(conv, stream=False).strip()
+
+        tool_call = maybe_extract_tool_call(reply)
+        if tool_call is None:
+            think("no explicit tool call detected; asking the model for a clean final answer with sentinel")
+            conv2 = conv + [
+                {"role": "assistant", "content": reply},
+                {"role": "user", "content": FINAL_INSTRUCTION},
+            ]
+            final_text = asi_chat(conv2, stream=False)
+            clean = sanitize_final(final_text)
+            if clean is None:
+                think("final answer contained unrelated noise; reprompting once for a concise clean answer")
+                conv3 = conv2 + [{"role": "user", "content": "Return ONLY the concise final answer. End with " + FINAL_SENTINEL}]
+                final_text = asi_chat(conv3, stream=False)
+                clean = sanitize_final(final_text)
+
+            if clean is None:
+                think("could not obtain a clean final answer; stopping")
+                print("❌ Aborted: could not produce a clean final answer.")
+                return
+
+            print("\n[answer]")
+            print(clean)
+            return
+
+        # Tool call path:
+        tool_name = tool_call["tool"]
+        params = normalize_params(tool_name, tool_call["params"])
+
+        # Log the intention in a concise way
+        think(f"chose tool: {tool_name} — purpose: {summarize_tool_purpose(tool_name)}")
+        # Brief param echo (safe)
+        think(f"with parameters: {json.dumps(params, separators=(',',':'))}")
+
+        if AVAILABLE_TOOLS and tool_name not in AVAILABLE_TOOLS:
+            payload = {"error": f"Unsupported MCP tool '{tool_name}'. Available: {AVAILABLE_TOOLS}"}
+            think("tool not recognized by the connected MCP server")
+        else:
+            try:
+                payload = mcp.tools_call(tool_name, params)
+                think(f"tool executed; {summarize_tool_result(tool_name, payload)}")
+            except Exception as exc:
+                payload = {"error": f"MCP tools/call failed: {exc}"}
+                think("tool execution failed")
+
+        # Feed call + result back so the model can decide next step
+        conv.append({"role": "assistant", "content": json.dumps({"tool": tool_name, "params": params}, separators=(",", ":"))})
+        conv.append({
+            "role": "user",
+            "content": (
+                f"TOOL_RESULT {tool_name} with params {json.dumps(params, separators=(',',':'))}:\n"
+                + "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+            ),
+        })
+
+        time.sleep(0.2)
+
+    think("reached max tool steps without a final answer")
+    print("⚠️ Reached max steps without a final answer.")
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
 if __name__ == "__main__":
-    agent.run()
+    if len(sys.argv) < 2:
+        print("Usage: python agent.py \"your question\"")
+        sys.exit(1)
+    prompt = " ".join(sys.argv[1:]).strip()
+    run(prompt)
