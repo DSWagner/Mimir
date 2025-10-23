@@ -237,17 +237,18 @@ except Exception as e:
 def _normalize_toolcall_object(obj: Any) -> Optional[Dict[str, Any]]:
     """
     Accepts:
-      {"tool": "...", "params": {...}}
+      {"tool": "...", "params": {...}, "intent": "..."}  # intent is optional
       {"tool": "...", "arguments": {...}}
       {"name": "...", "params": {...}}
       {"name": "...", "arguments": {...}}
-    -> returns {"tool": name, "params": params}
+    -> returns {"tool": name, "params": params, "intent": intent (optional)}
     """
     if not isinstance(obj, dict):
         return None
 
     tool_name = None
     params = None
+    intent = None
 
     if "tool" in obj:
         tool_name = obj["tool"]
@@ -259,8 +260,15 @@ def _normalize_toolcall_object(obj: Any) -> Optional[Dict[str, Any]]:
     elif "arguments" in obj and isinstance(obj["arguments"], dict):
         params = obj["arguments"]
 
+    # Extract intent if present (optional field)
+    if "intent" in obj and isinstance(obj["intent"], str):
+        intent = obj["intent"]
+
     if tool_name and isinstance(params, dict):
-        return {"tool": tool_name, "params": params}
+        result = {"tool": tool_name, "params": params}
+        if intent:
+            result["intent"] = intent
+        return result
 
     return None
 
@@ -346,27 +354,111 @@ FINAL_INSTRUCTION = (
 )
 
 # -----------------------------
-# System prompt
+# System prompt builder
 # -----------------------------
-SYSTEM_PROMPT = (
-    f"You are a blockchain expert. You can call Blockscout MCP tools via JSON-RPC at {MCP_URL}.\n"
-    "Use your judgment to decide when tool calls are needed and which tools to use.\n"
-    "When you choose to call a tool, output exactly ONE JSON object (no prose) with keys `tool` and `params`.\n"
-    "Example: {\"tool\":\"get_address_by_ens_name\",\"params\":{\"name\":\"vitalik.eth\"}}\n"
-    "After a tool result is returned to you, continue reasoning and decide the next step (another tool call or a final answer).\n"
-    "Do not mention or rely on any external agent marketplace; focus on the Blockscout MCP tools only.\n"
-    "When delivering the FINAL ANSWER, end your message with the exact token "
-    f"{FINAL_SENTINEL}\n"
-    "Available tools: " + ", ".join(AVAILABLE_TOOLS) + "\n"
-)
+def build_system_prompt(intent: Optional[str] = None) -> str:
+    """
+    Build system prompt, optionally with intent-specific guidance.
+    If intent is None, returns base prompt that asks LLM to provide intent.
+    """
+    base = (
+        f"You are a blockchain expert. You can call Blockscout MCP tools via JSON-RPC at {MCP_URL}.\n"
+        "Use your judgment to decide when tool calls are needed and which tools to use.\n"
+    )
+
+    if intent is None:
+        # Initial prompt: ask LLM to classify intent
+        base += (
+            "When you choose to call a tool, output exactly ONE JSON object with keys `tool`, `params`, and `intent`.\n"
+            "The `intent` field must be ONE of: \"On-chain data analysis\", \"Token analysis\", \"DeFi analysis\", \"Security\", \"Other\"\n"
+            "Example: {\"tool\":\"get_address_by_ens_name\",\"params\":{\"name\":\"vitalik.eth\"},\"intent\":\"On-chain data analysis\"}\n"
+        )
+    else:
+        # Subsequent calls: intent already classified, just ask for tool/params
+        base += (
+            "When you choose to call a tool, output exactly ONE JSON object with keys `tool` and `params`.\n"
+            "Example: {\"tool\":\"get_address_by_ens_name\",\"params\":{\"name\":\"vitalik.eth\"}}\n"
+        )
+
+        # Add intent-specific guidance
+        intent_guides = {
+            'On-chain data analysis': (
+                "\n=== PRIMARY FOCUS: On-Chain Data Analysis ===\n"
+                "You are analyzing blockchain data such as addresses, transactions, blocks, and contracts.\n"
+                "Prioritize accuracy and completeness when retrieving on-chain information.\n"
+                "Key patterns:\n"
+                "- For addresses: use get_address_info, get_tokens_by_address, nft_tokens_by_address\n"
+                "- For transactions: use get_transaction_info, get_transaction_logs, transaction_summary\n"
+                "- For contracts: use get_contract_abi, inspect_contract_code, read_contract\n"
+                "- For ENS: use get_address_by_ens_name first\n"
+            ),
+            'Token analysis': (
+                "\n=== PRIMARY FOCUS: Token Analysis ===\n"
+                "You are analyzing tokens (ERC-20, ERC-721, ERC-1155).\n"
+                "Focus on token metadata, supply, distribution, transfers, and holder information.\n"
+                "Key patterns:\n"
+                "- Use lookup_token_by_symbol to find token contracts\n"
+                "- Use read_contract for metadata (name, symbol, totalSupply, decimals)\n"
+                "- Use get_token_transfers_by_address for transfer history\n"
+                "- Use get_tokens_by_address for holdings\n"
+            ),
+            'DeFi analysis': (
+                "\n=== PRIMARY FOCUS: DeFi Protocol Analysis ===\n"
+                "You are analyzing DeFi protocols, liquidity pools, or decentralized exchange activity.\n"
+                "Look for contract interactions, token flows, and protocol-specific events.\n"
+                "Key patterns:\n"
+                "- Examine transaction logs for swap/transfer events\n"
+                "- Use read_contract to query pool states\n"
+                "- Track token flows using get_token_transfers_by_address\n"
+                "- Analyze contract interactions and event logs\n"
+            ),
+            'Security': (
+                "\n=== PRIMARY FOCUS: Security Analysis ===\n"
+                "You are performing security-related analysis on contracts or transactions.\n"
+                "Examine contract code, transaction patterns, and potential vulnerabilities carefully.\n"
+                "Key patterns:\n"
+                "- Use inspect_contract_code to review source code\n"
+                "- Use get_transaction_logs to examine event patterns\n"
+                "- Check contract verification status\n"
+                "- Analyze transaction flows for suspicious patterns\n"
+                "IMPORTANT: Provide informational analysis only; do not make definitive security claims.\n"
+            ),
+            'Other': (
+                "\n=== PRIMARY FOCUS: General Blockchain Query ===\n"
+                "You are answering a general blockchain question.\n"
+                "Adapt your approach based on what the user is asking.\n"
+                "Common patterns:\n"
+                "- Chain info: get_chains_list, get_latest_block, get_block_info\n"
+                "- Address lookups: get_address_by_ens_name, get_address_info\n"
+                "- On-chain data: read_contract, get_transaction_info\n"
+            ),
+        }
+
+        base += intent_guides.get(intent, intent_guides['Other'])
+
+    base += (
+        "\nAfter a tool result is returned to you, continue reasoning and decide the next step (another tool call or a final answer).\n"
+        "Do not mention or rely on any external agent marketplace; focus on the Blockscout MCP tools only.\n"
+        f"When delivering the FINAL ANSWER, end your message with the exact token {FINAL_SENTINEL}\n"
+        "Available tools: " + ", ".join(AVAILABLE_TOOLS) + "\n"
+    )
+
+    return base
+
+
+# Legacy static prompt (kept for reference)
+SYSTEM_PROMPT = build_system_prompt(intent=None)
 
 # -----------------------------
 # Main loop
 # -----------------------------
 def run(user_prompt: str) -> None:
     think("received the request and prepared the tool environment")
+
+    # Start with base prompt (asks for intent on first call)
+    current_intent = None
     conv: List[Dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": build_system_prompt(intent=None)},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -402,6 +494,13 @@ def run(user_prompt: str) -> None:
         # Tool call path:
         tool_name = tool_call["tool"]
         params = normalize_params(tool_name, tool_call["params"])
+
+        # Extract intent from first tool call and update system prompt
+        if current_intent is None and "intent" in tool_call:
+            current_intent = tool_call["intent"]
+            think(f"detected intent: {current_intent}")
+            # Update system message with intent-specific guidance
+            conv[0] = {"role": "system", "content": build_system_prompt(intent=current_intent)}
 
         # Log the intention in a concise way
         think(f"chose tool: {tool_name} — purpose: {summarize_tool_purpose(tool_name)}")
