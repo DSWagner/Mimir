@@ -39,7 +39,7 @@ ASI_TIMEOUT = (ASI_CONNECT_TIMEOUT, ASI_READ_TIMEOUT)
 
 MCP_URL = os.getenv("BLOCKSCOUT_MCP_URL", "http://localhost:8001/mcp")
 MCP_TIMEOUT = 60
-MAX_TOOL_STEPS = 12
+MAX_TOOL_STEPS = 120
 
 FINAL_SENTINEL = "<<<END>>>"
 
@@ -232,6 +232,55 @@ except Exception as e:
     AVAILABLE_TOOLS = []
 
 # -----------------------------
+# Intent extraction
+# -----------------------------
+# Intent key mapping: short snake_case keys for LLM responses
+INTENT_KEY_MAP = {
+    'onchain': 'On-chain data analysis',
+    'token': 'Token analysis',
+    'defi': 'DeFi analysis',
+    'security': 'Security',
+    'other': 'Other',
+}
+
+# Reverse mapping for display
+INTENT_DISPLAY_MAP = {v: k for k, v in INTENT_KEY_MAP.items()}
+
+
+def extract_intent(text: str) -> Optional[str]:
+    """
+    Extract intent from LLM reply.
+    Looks for intent in JSON tool call or standalone JSON.
+    Returns the full intent name (e.g., 'On-chain data analysis') or None.
+    """
+    # Try to find JSON in the text
+    try:
+        # Try direct JSON parse first
+        obj = json.loads(text.strip())
+        if isinstance(obj, dict) and "intent" in obj:
+            intent_key = obj["intent"]
+            # Map short key to full name
+            return INTENT_KEY_MAP.get(intent_key, intent_key)
+    except Exception:
+        pass
+
+    # Fallback: find first JSON block
+    s, e = text.find("{"), text.rfind("}")
+    if s != -1 and e > s:
+        try:
+            snippet = text[s:e + 1]
+            obj = json.loads(snippet)
+            if isinstance(obj, dict) and "intent" in obj:
+                intent_key = obj["intent"]
+                # Map short key to full name
+                return INTENT_KEY_MAP.get(intent_key, intent_key)
+        except Exception:
+            pass
+
+    return None
+
+
+# -----------------------------
 # Tool-call parsing & normalization
 # -----------------------------
 def _normalize_toolcall_object(obj: Any) -> Optional[Dict[str, Any]]:
@@ -367,11 +416,18 @@ def build_system_prompt(intent: Optional[str] = None) -> str:
     )
 
     if intent is None:
-        # Initial prompt: ask LLM to classify intent
+        # Initial prompt: ask LLM to classify intent using short keys
+        intent_options = ", ".join([f'"{k}"' for k in INTENT_KEY_MAP.keys()])
         base += (
             "When you choose to call a tool, output exactly ONE JSON object with keys `tool`, `params`, and `intent`.\n"
-            "The `intent` field must be ONE of: \"On-chain data analysis\", \"Token analysis\", \"DeFi analysis\", \"Security\", \"Other\"\n"
-            "Example: {\"tool\":\"get_address_by_ens_name\",\"params\":{\"name\":\"vitalik.eth\"},\"intent\":\"On-chain data analysis\"}\n"
+            f"The `intent` field must be ONE of: {intent_options}\n"
+            "Intent meanings:\n"
+            "- \"onchain\": On-chain data analysis (addresses, transactions, blocks, contracts)\n"
+            "- \"token\": Token analysis (ERC-20, ERC-721, NFTs, token metadata)\n"
+            "- \"defi\": DeFi protocol analysis (swaps, liquidity, staking)\n"
+            "- \"security\": Security analysis (audits, vulnerabilities)\n"
+            "- \"other\": General blockchain queries\n"
+            "Example: {\"tool\":\"get_address_by_ens_name\",\"params\":{\"name\":\"vitalik.eth\"},\"intent\":\"onchain\"}\n"
         )
     else:
         # Subsequent calls: intent already classified, just ask for tool/params
@@ -467,6 +523,15 @@ def run(user_prompt: str) -> None:
         think("deciding whether to call a tool or answer directly")
         reply = asi_chat(conv, stream=False).strip()
 
+        # Extract intent from first response if not already set
+        if current_intent is None:
+            extracted_intent = extract_intent(reply)
+            if extracted_intent:
+                current_intent = extracted_intent
+                think(f"detected intent: {current_intent}")
+                # Update system message with intent-specific guidance
+                conv[0] = {"role": "system", "content": build_system_prompt(intent=current_intent)}
+
         tool_call = maybe_extract_tool_call(reply)
         if tool_call is None:
             think("no explicit tool call detected; asking the model for a clean final answer with sentinel")
@@ -494,13 +559,6 @@ def run(user_prompt: str) -> None:
         # Tool call path:
         tool_name = tool_call["tool"]
         params = normalize_params(tool_name, tool_call["params"])
-
-        # Extract intent from first tool call and update system prompt
-        if current_intent is None and "intent" in tool_call:
-            current_intent = tool_call["intent"]
-            think(f"detected intent: {current_intent}")
-            # Update system message with intent-specific guidance
-            conv[0] = {"role": "system", "content": build_system_prompt(intent=current_intent)}
 
         # Log the intention in a concise way
         think(f"chose tool: {tool_name} — purpose: {summarize_tool_purpose(tool_name)}")
