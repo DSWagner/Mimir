@@ -398,7 +398,7 @@ def sanitize_final(text: str) -> Optional[str]:
     return text if text else None
 
 FINAL_INSTRUCTION = (
-    "Now produce ONLY the final user-facing answer, no analysis, no code fences, "
+    "Now produce ONLY the final user-facing answer, based on the prior specification. do not respond with code but rather a consize recap of the analysis and answer "
     f"and END with the token {FINAL_SENTINEL}. Do not add anything after the sentinel."
 )
 
@@ -537,7 +537,7 @@ def run(user_prompt: str) -> None:
             think("no explicit tool call detected; asking the model for a clean final answer with sentinel")
             conv2 = conv + [
                 {"role": "assistant", "content": reply},
-                {"role": "user", "content": FINAL_INSTRUCTION},
+                {"role": "user", "content": build_system_prompt(intent=current_intent)+FINAL_INSTRUCTION},
             ]
             final_text = asi_chat(conv2, stream=False)
             clean = sanitize_final(final_text)
@@ -571,6 +571,7 @@ def run(user_prompt: str) -> None:
         else:
             try:
                 payload = mcp.tools_call(tool_name, params)
+                think(f"payload: {payload}")
                 think(f"tool executed; {summarize_tool_result(tool_name, payload)}")
             except Exception as exc:
                 payload = {"error": f"MCP tools/call failed: {exc}"}
