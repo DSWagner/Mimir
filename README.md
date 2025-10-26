@@ -81,26 +81,6 @@ Create a `.env` in the project root if you prefer environment‑file configurati
 
 ---
 
-## 🔧 Install & Run (local dev)
-
-```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-python -m pip install -r requirements.txt
-# or: pip install uagents requests python-dotenv
-python agent.py
-```
-
-You should see logs like:
-
-```
-🚀 Starting Mimir <agent-address>
-🔐 ASI API key detected at startup.
-✅ MCP connected (<N> tools): get_transactions_by_address, ...
-🔓 Preloaded blockchain analysis instructions.
-Manifest published successfully: chat
-```
-
 ### Messaging the agent locally
 
 Mimir publishes the **uAgents chat protocol** manifest. You can message it from another uAgents script (or from Agentverse). Minimal example:
