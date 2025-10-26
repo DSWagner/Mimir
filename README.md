@@ -1,172 +1,163 @@
-# Mimir MCP Agent — Local Setup Guide
+# Mimir — Blockscout Agent for Agentverse
 
-This repo wires up a local **uAgents**-based agent that talks to the **Blockscout MCP server** and uses **ASI:One** to (1) pick the right MCP tool and (2) prettify raw results into concise, human‑readable Markdown.
-
-> TL;DR: You’ll run a Dockerized MCP server on port **8001**, start the Python agent on port **8000**, then send prompts via a simple REST call.
+> Autonomous blockchain analyst that uses **Blockscout MCP** tools and **ASI's asi1-extended LLM** to investigate and explain on-chain activity across multiple EVM chains.
 
 ---
 
-## 🧱 Architecture (high level)
+## ✨ What is Mimir?
 
-- **Blockscout MCP Server (Docker)** → exposes blockchain tools over REST (we’ll use `GET /v1/...` endpoints)
-- **Agent (Python/uAgents)** → receives your prompts, asks **ASI:One** which tool to call, executes it on the MCP server, then pretty‑formats the result
-- **You (PowerShell)** → send a prompt to `http://127.0.0.1:8000/chat`
+**Mimir** is an advanced autonomous analysis agent built with **uAgents** that connects to the **Blockscout MCP** (Modular Chain Protocol) server to retrieve verified, explorer‑grade data (transactions, token transfers, contract metadata/ABI, etc.).  
+It reasons step‑by‑step with **ASI’s `asi1-extended`** model and produces clear, human‑readable explanations of what’s happening on‑chain.
 
-Ports:
-
-- MCP server → **8001** (container `8000` mapped to host `8001`)
-- Agent → **8000**
-
-> ⚠️ **Important:** Keep **8001** for the MCP server to avoid clashing with the agent’s port (**8000**).
+Mimir is designed first for **ASI Agentverse**, but it can run locally for development and can be messaged via the standard **uAgents Chat Protocol**.
 
 ---
 
-## ✅ Prerequisites
+## 🧠 Key Features (mapped to code)
 
-- **Windows** + **PowerShell** (examples use PS)
-- **Docker** installed and running
-- **Python 3.10+** with **venv**
-- An **ASI API key** (for ASI:One) — this is required for tool selection & pretty summaries
+- **Async‑safe LLM + MCP orchestration** (LLM calls wrapped with `asyncio.to_thread`)
+- **Unlock‑first rule**: always calls `__unlock_blockchain_analysis__` as the very first tool
+- **Deep system prompt** with:
+  - explicit final‑answer sentinel `<<<FINAL_ANSWER>>>`
+  - pagination & time-window tactics
+  - binary search strategy for historical ranges
+  - tool argument validation rules (e.g., `chain_id` must be a **string**)
+- **Auto‑refresh MCP tools every 12h** and caches tools in storage
+- **Conversation trimming** (`MAX_HISTORY=10`) to keep context focused
+- **Tool schema validation** + **autofill `chain_id`** (string) using text hints & defaults
+- **Safe tool execution** with retries/backoff; errors are returned as `TOOL_RESULT`
+- **Sanitized logging** (masks keys/tokens)
+- **Instruction injection** from unlock tool results
+- **SSE parsing** for MCP responses with idle‑timeout safeguards
 
----
-
-## 1) Clone the repo
-
-```powershell
-git clone <your-repo-url> mimir
-cd .\mimir
-```
-
-> The rest of the steps assume your current directory is the repo root (`.\mimir`).
-
----
-
-## 2) Create & activate a virtual environment **inside `./mimir/`**
-
-```powershell
-# From .\mimir
-py -m venv .\venv
-.\venv\Scripts\Activate.ps1
-```
-
-Your prompt should now display `(venv)` at the beginning.
+> See the header docstring of `agent.py` for a concise checklist of the above.
 
 ---
 
-## 3) Install Python dependencies
-
-We’ll install from the provided requirements file located at `./mimir/requirements.txt`:
-
-```powershell
-(venv) PS .\mimir> python -m pip install -r .\mimir\requirements.txt
-```
-
-If you’re already inside the `mimir` folder, you can also use:
-
-```powershell
-(venv) PS .\mimir> python -m pip install -r .\requirements.txt
-```
-
-> Tip: A minimal dependency set for this project is typically: `uagents`, `requests`, `python-dotenv`.
-
----
-
-## 4) Configure your `.env`
-
-Create a file named `.env` in the repo root (`.\mimir\.env`) with your ASI key:
+## 🧩 Architecture Overview
 
 ```
-ASI_API_KEY=your_asi_api_key_here
-# Optional override (default is asi1-mini)
-ASI_MODEL=asi1-mini
-# MCP base URL (defaults to http://localhost:8001)
-MCP_BASE_URL=http://localhost:8001
+User (Agentverse chat or any uAgents client)
+        │
+        ▼
+Mimir Agent (uAgents)
+  ├─ LLM: ASI chat completions (model: asi1-extended)
+  ├─ System prompt builder (+ unlock instruction injection)
+  ├─ Tool runner (validation, retries, backoff, pagination)
+  └─ Context manager (history trim, final sentinel)
+        │
+        ▼
+Blockscout MCP Server (JSON‑RPC over HTTP/S + SSE)
+  └─ Tools: address/tx/token/ABI/ENS/etc.
 ```
 
-The agent loads this automatically (via `python-dotenv`).
+- **ASI endpoint**: `https://api.asi1.ai/v1/chat/completions`
+- **MCP endpoint (default)**: `https://mcp.blockscout.com/mcp` (JSON‑RPC; not REST)
+- **Chat protocol**: [`uagents_core.contrib.protocols.chat`](https://github.com/fetchai/uAgents) (manifest is published by the agent)
 
 ---
 
-## 5) Start the Blockscout MCP server (Docker)
+## 📦 Requirements
 
-Open a **new** PowerShell terminal (e.g., in Cursor IDE) and run:
+- **Python 3.10+**
+- `uagents`, `requests`, `python-dotenv`
 
-```powershell
-docker run --rm -p 8001:8000 ghcr.io/blockscout/mcp-server:latest python -m blockscout_mcp_server --http --rest --http-host 0.0.0.0
-```
-
-- Leave the **first port as 8001** (host:container is `8001:8000`) so it **doesn’t collide** with the agent (which runs on **8000**).
-- You can sanity-check it with:
-  ```powershell
-  Invoke-RestMethod http://localhost:8001/v1/tools -Method GET | ConvertTo-Json -Depth 4
-  ```
-
-Leave this terminal **open** — the server must keep running.
+> If you use a private MCP instance, it must support the **MCP JSON‑RPC** interface (the code calls `tools/list` and `tools/call`), and ideally **SSE** for streamed results.
 
 ---
 
-## 6) Start the Agent
+## ⚙️ Environment Variables
 
-Back in your **venv terminal** (the one with `(venv)` in the prompt):
+Create a `.env` in the project root if you prefer environment‑file configuration.
 
-```powershell
-(venv) PS .\mimir> python .\agent.py
+| Variable             | Description                                  | Default                          |
+| -------------------- | -------------------------------------------- | -------------------------------- |
+| `ASI_API_KEY`        | Primary ASI key for `asi1-extended`          | —                                |
+| `ASI_ONE_API_KEY`    | Fallback env var name for the ASI key        | —                                |
+| `BLOCKSCOUT_MCP_URL` | MCP JSON‑RPC base URL                        | `https://mcp.blockscout.com/mcp` |
+| `DEFAULT_CHAIN_ID`   | Chain used when not inferable from user text | `1` (Ethereum)                   |
+
+> The runtime loader checks: `ASI_API_KEY` → `ASI_ONE_API_KEY` → `ctx.storage["asi_api_key"]`.
+
+---
+
+## 🔧 Install & Run (local dev)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
+# or: pip install uagents requests python-dotenv
+python agent.py
 ```
 
 You should see logs like:
 
 ```
-[blockscout_mcp_agent]: Starting server on http://0.0.0.0:8000
-[blockscout_mcp_agent]: Manifest published successfully: chat
-[asi_orchestrator] ✅ ASI_API_KEY loaded from .env
+🚀 Starting Mimir <agent-address>
+🔐 ASI API key detected at startup.
+✅ MCP connected (<N> tools): get_transactions_by_address, ...
+🔓 Preloaded blockchain analysis instructions.
+Manifest published successfully: chat
 ```
 
-> The agent automatically performs a one‑time “unlock” call if the MCP server requires it.
+### Messaging the agent locally
 
----
+Mimir publishes the **uAgents chat protocol** manifest. You can message it from another uAgents script (or from Agentverse). Minimal example:
 
-## 7) Send a test prompt
+```python
+# examples/ping.py
+from uagents import Agent, Context, Protocol
+from uagents_core.contrib.protocols.chat import ChatMessage, TextContent, chat_protocol_spec
 
-In **another** PowerShell terminal (while both the Docker container and the agent are running), send a prompt to the agent:
+SENDER = Agent(name="tester", seed="tester_seed", mailbox=True)
+chat_protocol = Protocol(spec=chat_protocol_spec)
+SENDER.include(chat_protocol)
 
-```powershell
-$body = @{ text = "What is the balance on address 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045 on Ethereum chain?" } | ConvertTo-Json
-Invoke-RestMethod -Uri "http://127.0.0.1:8000/chat" -Method POST -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 8
+@chat_protocol.on_interval(period=2)
+async def send(_ctx: Context):
+    await SENDER.send("<MIMIR_AGENT_ADDRESS>", ChatMessage(content=[TextContent(type="text", text="Analyze transfers for 0xd8dA6... on Ethereum")]))
+
+if __name__ == "__main__":
+    SENDER.run()
 ```
 
-You should receive a human‑friendly Markdown summary (the agent uses ASI to format the raw JSON).
+Replace `<MIMIR_AGENT_ADDRESS>` with the address from Mimir’s startup logs.
 
 ---
 
-## 🔍 Troubleshooting
+## 🔐 Behavior & Guardrails
 
-- **`ASI_API_KEY is not set`**  
-  Ensure `.env` exists in the repo root and contains your key. Restart the agent after adding it.
-
-- **`404 Not Found for url: https://api.asi1.ai/v1/chat/completions`**  
-  Check that your model name is `asi1-mini` (with the `1`). You can set `ASI_MODEL=asi1-mini` in `.env`.
-
-- **`404 Not Found` on `/tools/call`**  
-  Your MCP build uses **per‑tool GET endpoints** (`/v1/get_address_info?…`) and **not** `POST /v1/tools/call`. The client code already handles this automatically.
-
-- **Port conflicts**  
-  Keep MCP on **8001** and the agent on **8000** as shown above.
-
-- **Verify MCP server is reachable**
-  ```powershell
-  Invoke-RestMethod http://localhost:8001/v1/tools -Method GET
-  ```
+- **Unlock‑first**: refuses to proceed if the first step/tool isn’t `__unlock_blockchain_analysis__`.
+- **Tool parameter rules**: validates required fields; autofills **`chain_id` as a string** using chain hints (`ethereum → "1"`, `polygon → "137"`, `arbitrum → "42161"`, `base → "8453"`, `bsc → "56"`, etc.).
+- **Pagination**: if a tool result returns a `pagination.next_call`, Mimir continues until done or a reasonable limit.
+- **Time‑based search**: supports `age_from` / `age_to` in ISO‑8601; can binary‑search long histories.
+- **Security**: never exposes system prompts; masks secrets in logs; returns tool errors inside `TOOL_RESULT` instead of crashing.
+- **Context limits**: trims conversation to `MAX_HISTORY=10`; final answers end with the sentinel `<<<FINAL_ANSWER>>>` (removed before sending).
 
 ---
 
-## 🧯 Notes
+## 🧪 Troubleshooting
 
-- The agent exposes a REST route at `POST /chat` that accepts `{ "text": "..." }` and returns `{ "text": "..." }`.
-- The agent discovers MCP tools, orchestrates tool selection via ASI, and pretty‑formats results. It also auto‑calls the unlock tool once per run where required.
-- This setup is **local‑first** — nothing is deployed publicly unless you choose to.
+- **“ASI_API_KEY not configured”** — Ensure the key is present in environment or `.env`.
+- **MCP connection failed** — Verify `BLOCKSCOUT_MCP_URL`, network access, and that your MCP server supports **JSON‑RPC** (`tools/list`, `tools/call`) and responds with JSON or SSE.
+- **Finalizing without unlock** — Check that the MCP has the `__unlock_blockchain_analysis__` tool; the agent attempts to call it first.
+- **Chain ID type errors** — All tool `chain_id` parameters must be **strings** (e.g., `"1"`). The agent will warn if it detects numeric usage.
+
+---
+
+## 🗺️ Configuration knobs (edit in `agent.py`)
+
+- `ASI_ENDPOINT = "https://api.asi1.ai/v1/chat/completions"`
+- `ASI_MODEL = "asi1-extended"`
+- `MCP_URL` from `BLOCKSCOUT_MCP_URL` (default `"https://mcp.blockscout.com/mcp"`)
+- `MCP_TIMEOUT = 90`
+- `MAX_TOOL_STEPS = 25`
+- `MAX_HISTORY = 10`
+- `FINAL_SENTINEL = "<<<FINAL_ANSWER>>>"`
 
 ---
 
 ## 📄 License
 
-MIT (or your preferred license). Update this section to match your project.
+MIT (replace with your actual license if different).
