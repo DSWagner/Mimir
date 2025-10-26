@@ -398,7 +398,7 @@ def sanitize_final(text: str) -> Optional[str]:
     return text if text else None
 
 FINAL_INSTRUCTION = (
-    "Now produce ONLY the final user-facing answer, based on the prior specification. do not respond with code but rather a consize recap of the analysis and answer "
+    "Now produce ONLY the final user-facing answer, based on the prior specification. do not respond with code or explain why some tool failed, if so only state that some services were unavailable and state which tool was used for the source. Respond with a consize recap of the analysis and answer "
     f"and END with the token {FINAL_SENTINEL}. Do not add anything after the sentinel."
 )
 
@@ -457,6 +457,9 @@ def build_system_prompt(intent: Optional[str] = None) -> str:
                 "- Use read_contract for metadata (name, symbol, totalSupply, decimals)\n"
                 "- Use get_token_transfers_by_address for transfer history\n"
                 "- Use get_tokens_by_address for holdings\n"
+                "Structure the resposne with a high level summary of the token and a detailed analysis of the token\n"
+                "Provide information about which chains and networks the token is related to\n"
+                "Provide a rich and insightful view of the token and related topics\n"
             ),
             'DeFi analysis': (
                 "\n=== PRIMARY FOCUS: DeFi Protocol Analysis ===\n"
@@ -467,26 +470,30 @@ def build_system_prompt(intent: Optional[str] = None) -> str:
                 "- Use read_contract to query pool states\n"
                 "- Track token flows using get_token_transfers_by_address\n"
                 "- Analyze contract interactions and event logs\n"
+                "Structure the resposne with a high level summary of the token and a detailed analysis of the token\n"
+                "Provide information about which chains and networks the token is related to\n"
+                "Provide a rich and insightful view of the token and related topics\n"
             ),
             'Security': (
                 "\n=== PRIMARY FOCUS: Security Analysis ===\n"
                 "You are performing security-related analysis on contracts or transactions.\n"
-                "Examine contract code, transaction patterns, and potential vulnerabilities carefully.\n"
+                "Acces and examine contract code via MCP, transaction patterns, and potential vulnerabilities carefully.\n"
                 "Key patterns:\n"
                 "- Use inspect_contract_code to review source code\n"
                 "- Use get_transaction_logs to examine event patterns\n"
                 "- Check contract verification status\n"
                 "- Analyze transaction flows for suspicious patterns\n"
+                "- Access the raw code a perform a simplyfied static anlysis of the code itself\n"
                 "IMPORTANT: Provide informational analysis only; do not make definitive security claims.\n"
             ),
             'Other': (
                 "\n=== PRIMARY FOCUS: General Blockchain Query ===\n"
                 "You are answering a general blockchain question.\n"
                 "Adapt your approach based on what the user is asking.\n"
-                "Common patterns:\n"
-                "- Chain info: get_chains_list, get_latest_block, get_block_info\n"
-                "- Address lookups: get_address_by_ens_name, get_address_info\n"
-                "- On-chain data: read_contract, get_transaction_info\n"
+                "Provide a high level structured anyalysis and expand on related fact about the query\n"
+                "Always include a short summary of queried topic and expand on it\n"
+                "Provide information about which chains and networks the query is related to\n"
+                "Provide a rich and insightful view of the query and related topics\n"
             ),
         }
 
