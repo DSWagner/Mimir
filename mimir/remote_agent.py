@@ -19,6 +19,7 @@ import uuid
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
 
 import requests
 from uagents import Agent, Context, Protocol
@@ -60,6 +61,90 @@ CHAIN_HINTS = {
     "bsc": "56",
     "binance smart chain": "56",
 }
+
+# -----------------------------
+# Structured Tool Call Tracking
+# -----------------------------
+@dataclass
+class ToolCallRecord:
+    """Track individual tool call execution with full context"""
+    step: int
+    tool_name: str
+    params: Dict[str, Any]
+    result: Dict[str, Any]
+    timestamp: float
+    success: bool
+    error: Optional[str] = None
+    llm_reasoning: str = ""  # LLM's reasoning before this call
+
+    def to_context_string(self, verbose: bool = True) -> str:
+        """Format for LLM context with varying detail levels"""
+        if not self.success:
+            return f"[Step {self.step}] {self.tool_name} FAILED: {self.error}"
+
+        if verbose:
+            result_str = format_tool_result(self.tool_name, self.result)
+            return f"[Step {self.step}] {self.tool_name}\nResult:\n{result_str}"
+        else:
+            # Condensed format for older calls
+            result_size = len(str(self.result))
+            return f"[Step {self.step}] {self.tool_name} → {result_size} bytes"
+
+    def get_summary(self) -> str:
+        """Brief one-line summary"""
+        status = "✓" if self.success else "✗"
+        return f"{status} {self.tool_name}"
+
+
+@dataclass
+class ToolCallChain:
+    """Track related tool calls to understand workflows"""
+    chains: List[List[ToolCallRecord]] = field(default_factory=list)
+    current_chain: List[ToolCallRecord] = field(default_factory=list)
+
+    def add_call(self, record: ToolCallRecord):
+        """Add a call and detect if it's part of current workflow"""
+        if self._is_related(record):
+            self.current_chain.append(record)
+        else:
+            if self.current_chain:
+                self.chains.append(self.current_chain)
+            self.current_chain = [record]
+
+    def _is_related(self, record: ToolCallRecord) -> bool:
+        """Check if current call uses data from previous call"""
+        if not self.current_chain:
+            return False
+
+        last_result = self.current_chain[-1].result
+        current_params = record.params
+
+        # Check if any parameter values appear in last result
+        try:
+            last_result_str = json.dumps(last_result).lower()
+            for value in current_params.values():
+                if str(value).lower() in last_result_str:
+                    return True
+        except Exception:
+            pass
+
+        return False
+
+    def get_chain_summary(self) -> str:
+        """Provide workflow summary for context"""
+        if not self.current_chain:
+            return ""
+
+        workflow = " → ".join([call.tool_name for call in self.current_chain])
+        return f"Current workflow: {workflow}"
+
+    def get_all_records(self) -> List[ToolCallRecord]:
+        """Get all tool call records in order"""
+        all_records = []
+        for chain in self.chains:
+            all_records.extend(chain)
+        all_records.extend(self.current_chain)
+        return all_records
 
 # -----------------------------
 # System prompt builder (from v2, enhanced)
@@ -283,6 +368,269 @@ def format_tool_result(tool_name: str, result: Dict[str, Any]) -> str:
         result_str = result_str[:12000] + "\n... [truncated for context limit]"
     return result_str
 
+
+def format_tool_result_contextual(
+    tool_name: str,
+    result: Dict[str, Any],
+    previous_calls: List[ToolCallRecord]
+) -> str:
+    """Format tool results with context awareness for better LLM understanding"""
+    # Base formatting
+    formatted = format_tool_result(tool_name, result)
+
+    # Check if this is a repeated call (e.g., pagination)
+    recent_same_tool = [r for r in previous_calls[-3:] if r.tool_name == tool_name]
+    if len(recent_same_tool) > 1:
+        formatted = f"[Continuation of {tool_name}]\n{formatted}"
+
+    return formatted
+
+
+def get_next_step_guidance(tool_name: str, result: Dict[str, Any]) -> str:
+    """Suggest logical next steps based on current result"""
+    guidance_parts = []
+
+    # ENS resolution guidance
+    if tool_name == "get_address_by_ens_name":
+        if isinstance(result, dict) and "content" in result:
+            for item in result.get("content", []):
+                if isinstance(item, dict) and "address" in str(item):
+                    guidance_parts.append("You can now analyze this address with get_address_info or get_transactions_by_address")
+                    break
+
+    # Token lookup guidance
+    if tool_name == "lookup_token_by_symbol":
+        if isinstance(result, dict) and "content" in result:
+            for item in result.get("content", []):
+                if isinstance(item, dict):
+                    try:
+                        text = item.get("text", "")
+                        data = json.loads(text) if text else {}
+                        items = data.get("items", [])
+                        if len(items) > 1:
+                            guidance_parts.append("Multiple tokens found - you may need to specify chain_id or examine each contract")
+                    except Exception:
+                        pass
+
+    # Pagination guidance
+    if isinstance(result, dict) and "content" in result:
+        for item in result.get("content", []):
+            if isinstance(item, dict):
+                try:
+                    text = item.get("text", "")
+                    data = json.loads(text) if text else {}
+                    if "pagination" in data:
+                        pagination = data["pagination"]
+                        if pagination.get("has_next_page"):
+                            guidance_parts.append(f"More data available via pagination (current items: {pagination.get('items_count', 'unknown')})")
+                except Exception:
+                    pass
+
+    return " | ".join(guidance_parts) if guidance_parts else ""
+
+
+def create_contextual_tool_response(
+    tool_name: str,
+    result: Dict[str, Any],
+    previous_calls: List[ToolCallRecord]
+) -> str:
+    """Add semantic context to help LLM understand significance"""
+    formatted_result = format_tool_result_contextual(tool_name, result, previous_calls)
+
+    # Detect significant patterns
+    markers = []
+
+    # Check for errors
+    if "error" in result or (isinstance(result, dict) and not result.get("success", True)):
+        markers.append("⚠️ ISSUE DETECTED")
+
+    # Check for empty results
+    if isinstance(result, dict) and "content" in result:
+        for item in result.get("content", []):
+            if isinstance(item, dict):
+                try:
+                    text = item.get("text", "")
+                    data = json.loads(text) if text else {}
+                    items = data.get("items", [])
+                    if isinstance(items, list):
+                        if len(items) == 0:
+                            markers.append("📭 NO RESULTS")
+                        elif len(items) > 100:
+                            markers.append(f"📊 LARGE DATASET ({len(items)} items)")
+                except Exception:
+                    pass
+
+    # Get guidance
+    guidance = get_next_step_guidance(tool_name, result)
+
+    # Construct response
+    response = f"TOOL_RESULT for {tool_name}:\n"
+    if markers:
+        response += " | ".join(markers) + "\n"
+    response += f"```json\n{formatted_result}\n```"
+    if guidance:
+        response += f"\n\n💡 Context: {guidance}"
+
+    return response
+
+
+def compress_conversation_history(
+    conversation: List[Dict[str, str]],
+    tool_chain: ToolCallChain,
+    max_entries: int = 10,
+    preserve_recent: int = 5
+) -> List[Dict[str, str]]:
+    """
+    Intelligent context compression that preserves important information.
+    Keeps: system prompt, original query, failed calls, recent history.
+    Compresses: intermediate successful calls.
+    """
+    if len(conversation) <= max_entries:
+        return conversation
+
+    # Always preserve
+    system_prompt = conversation[0]
+    original_query = conversation[1] if len(conversation) > 1 else None
+
+    # Split into sections
+    recent_start = max(2, len(conversation) - (preserve_recent * 2))
+    recent = conversation[recent_start:]
+    middle = conversation[2:recent_start]
+
+    # Build compressed version
+    compressed = [system_prompt]
+    if original_query:
+        compressed.append(original_query)
+
+    # Summarize middle section if it exists
+    if middle and len(middle) > 4:
+        all_records = tool_chain.get_all_records()
+        # Only summarize tools that are not in the recent section
+        older_records = all_records[:-(preserve_recent)] if len(all_records) > preserve_recent else []
+
+        if older_records:
+            summary_parts = []
+            for record in older_records:
+                summary_parts.append(record.get_summary())
+
+            # Group by success/failure
+            successful = [r for r in older_records if r.success]
+            failed = [r for r in older_records if not r.success]
+
+            summary = f"[Previous Actions Summary]\n"
+            if successful:
+                summary += f"✓ Executed {len(successful)} successful tool calls: " + ", ".join([r.tool_name for r in successful]) + "\n"
+            if failed:
+                summary += f"✗ {len(failed)} failed attempts: " + ", ".join([f"{r.tool_name} ({r.error})" for r in failed])
+
+            compressed.append({
+                "role": "user",
+                "content": summary
+            })
+
+    # Add recent history (preserve exact format for model behavior)
+    compressed.extend(recent)
+
+    return compressed
+
+
+def summarize_tool_chain(records: List[ToolCallRecord]) -> str:
+    """Create a concise summary of a tool call sequence"""
+    if not records:
+        return "No previous tool calls."
+
+    successful = [r for r in records if r.success]
+    failed = [r for r in records if not r.success]
+
+    summary = []
+    if successful:
+        tool_names = [r.tool_name for r in successful]
+        summary.append(f"Completed: {', '.join(tool_names)}")
+    if failed:
+        summary.append(f"Failed: {', '.join([f'{r.tool_name} ({r.error})' for r in failed])}")
+
+    return " | ".join(summary)
+
+def build_prioritized_context(
+    system_prompt: str,
+    user_query: str,
+    tool_chain: ToolCallChain,
+    conversation: List[Dict[str, str]],
+    max_entries: int = 10,
+    preserve_recent: int = 5
+) -> List[Dict[str, str]]:
+    """
+    Build context with priority order:
+    1. System prompt (always)
+    2. Original user query (always)
+    3. Failed tool calls (high priority - for learning)
+    4. Most recent tool results (high priority)
+    5. Summary of older successful calls (medium priority)
+    """
+    if len(conversation) <= max_entries:
+        return conversation
+
+    prioritized = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_query}
+    ]
+
+    all_records = tool_chain.get_all_records()
+
+    # High priority: Failed tool calls with full context
+    failed_records = [r for r in all_records if not r.success]
+    recent_failed = failed_records[-2:] if len(failed_records) > 0 else []
+
+    # High priority: Recent successful tool calls
+    recent_successful = [r for r in all_records[-preserve_recent:] if r.success]
+
+    # Build priority sections
+    priority_messages = []
+
+    # Add failed calls first (highest priority for learning)
+    for failed in recent_failed:
+        # Add the LLM's reasoning that led to this call
+        if failed.llm_reasoning:
+            priority_messages.append({
+                "role": "assistant",
+                "content": failed.llm_reasoning
+            })
+
+        # Add error feedback
+        error_context = f"TOOL_RESULT for {failed.tool_name}:\n"
+        error_context += f"⚠️ ERROR: {failed.error}\n"
+        if failed.params:
+            error_context += f"Parameters used: {json.dumps(failed.params, indent=2)}\n"
+        error_context += "\nPlease adjust your approach and try again."
+
+        priority_messages.append({
+            "role": "user",
+            "content": error_context
+        })
+
+    # Add summary of middle successful calls if many exist
+    middle_successful = [r for r in all_records[:-preserve_recent] if r.success]
+    if len(middle_successful) > 3:
+        summary = f"[Previous Successful Actions]\n"
+        summary += f"Completed {len(middle_successful)} tool calls:\n"
+        for record in middle_successful[-5:]:  # Last 5 of the middle section
+            summary += f"  • {record.tool_name}\n"
+
+        priority_messages.append({
+            "role": "user",
+            "content": summary
+        })
+
+    # Add recent successful calls with full context
+    # Get the actual conversation entries for these calls
+    recent_start_idx = max(2, len(conversation) - (preserve_recent * 2))
+    priority_messages.extend(conversation[recent_start_idx:])
+
+    prioritized.extend(priority_messages)
+
+    return prioritized
+
+
 def sanitize_final_answer(text: str) -> str:
     if FINAL_SENTINEL in text:
         text = text.split(FINAL_SENTINEL, 1)[0]
@@ -346,23 +694,153 @@ async def async_query_llm(ctx: Context, messages: List[Dict[str, str]]) -> str:
         ctx.logger.error(f"LLM query failed: {e}")
         raise
 
-def safe_tool_call(client: McpClient, name: str, params: Dict[str, Any], retries=3, delay=2) -> Dict[str, Any]:
-    """Typed retries + backoff. Returns structured error instead of raising."""
+def generate_fix_suggestions(
+    client: McpClient,
+    tool_name: str,
+    params: Dict[str, Any],
+    error: Exception
+) -> List[str]:
+    """Generate actionable fix suggestions for the LLM"""
+    suggestions = []
+    error_str = str(error).lower()
+
+    try:
+        schema = client._schema_for(tool_name)
+        required = schema.get("required", [])
+        props = schema.get("properties", {})
+
+        # Missing parameter suggestions
+        missing = [r for r in required if r not in params]
+        if missing:
+            for param in missing:
+                param_info = props.get(param, {})
+                param_type = param_info.get("type", "unknown")
+                suggestions.append(f"Add required parameter '{param}' (type: {param_type})")
+
+                # Add specific hints for common parameters
+                if param == "chain_id":
+                    suggestions.append("chain_id must be a STRING like '1' (Ethereum mainnet), '137' (Polygon), etc.")
+                elif param == "address":
+                    suggestions.append("address should be a valid hex address starting with '0x'")
+                elif param == "hash":
+                    suggestions.append("hash should be a transaction hash starting with '0x'")
+
+        # Type mismatch suggestions
+        for k, v in params.items():
+            expected_type = props.get(k, {}).get("type")
+            actual_type = type(v).__name__
+
+            if expected_type == "string" and not isinstance(v, str):
+                suggestions.append(f"Convert '{k}' to string: use '{v}' instead of {v}")
+            elif expected_type == "integer" and not isinstance(v, int):
+                suggestions.append(f"Convert '{k}' to integer: use {int(v)} instead of '{v}'")
+            elif expected_type == "number" and not isinstance(v, (int, float)):
+                suggestions.append(f"Convert '{k}' to number")
+
+        # Format-specific suggestions
+        if "invalid" in error_str or "format" in error_str:
+            for k, v in params.items():
+                if "address" in k.lower() and isinstance(v, str):
+                    if not v.startswith("0x"):
+                        suggestions.append(f"Address format issue: '{k}' should start with '0x'")
+                    if len(v) != 42:
+                        suggestions.append(f"Address length issue: '{k}' should be 42 characters (0x + 40 hex digits)")
+
+    except Exception:
+        # If we can't generate specific suggestions, provide general guidance
+        suggestions.append("Check parameter types and values against tool schema")
+
+    return suggestions
+
+
+def safe_tool_call_enhanced(
+    client: McpClient,
+    name: str,
+    params: Dict[str, Any],
+    call_context: Dict[str, Any],
+    retries: int = 3,
+    delay: int = 2
+) -> Dict[str, Any]:
+    """Enhanced error handling with actionable context and fix suggestions"""
     last_err = None
+    error_details = {}
+
     for i in range(retries):
         try:
             client.validate_tool_call(name, params)
-            return client.call_tool(name, params)
+            result = client.call_tool(name, params)
+            return {"success": True, "result": result}
+
+        except ValueError as e:
+            # Validation errors - provide fix suggestions
+            suggestions = generate_fix_suggestions(client, name, params, e)
+            return {
+                "success": False,
+                "error": str(e),
+                "error_type": "validation",
+                "suggestions": suggestions,
+                "tool": name,
+                "params": params,
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "error": str(e),
+                        "error_type": "validation",
+                        "suggestions": suggestions,
+                        "tool": name
+                    }, indent=2)
+                }]
+            }
+
         except (requests.Timeout, requests.ConnectionError) as e:
+            # Network errors - retry with backoff
             time.sleep(delay * (2 ** i))
             last_err = f"{type(e).__name__}: {str(e)}"
+            error_details = {
+                "error_type": "network",
+                "retry_count": i + 1,
+                "max_retries": retries
+            }
             continue
+
         except Exception as e:
+            # Other errors
             last_err = str(e)
+            error_details = {
+                "error_type": "unknown",
+                "tool": name,
+                "params": params
+            }
             if i < retries - 1:
                 time.sleep(delay)
             continue
-    return {"error": last_err or "unknown_error"}
+
+    # Exhausted retries
+    final_error = last_err or "unknown_error"
+    return {
+        "success": False,
+        "error": final_error,
+        "exhausted_retries": True,
+        **error_details,
+        "content": [{
+            "type": "text",
+            "text": json.dumps({
+                "error": final_error,
+                "exhausted_retries": True,
+                **error_details
+            }, indent=2)
+        }]
+    }
+
+
+def safe_tool_call(client: McpClient, name: str, params: Dict[str, Any], retries=3, delay=2) -> Dict[str, Any]:
+    """Typed retries + backoff. Returns structured error instead of raising."""
+    # Wrapper to maintain backward compatibility
+    result = safe_tool_call_enhanced(client, name, params, {}, retries, delay)
+    if result.get("success"):
+        return result["result"]
+    else:
+        return {"error": result.get("error", "unknown_error")}
 
 # -----------------------------
 # Agent setup
@@ -459,11 +937,14 @@ async def on_message(ctx: Context, sender: str, msg: ChatMessage):
 
     # Build system prompt (inject any preloaded instructions)
     extra = ctx.storage.get("unlock_extra_instructions") or ""
+    system_prompt_content = build_system_prompt(extra)
     conversation: List[Dict[str, str]] = [
-        {"role": "system", "content": build_system_prompt(extra)},
+        {"role": "system", "content": system_prompt_content},
         {"role": "user", "content": text},
     ]
 
+    # Initialize tracking structures
+    tool_chain = ToolCallChain()
     unlocked = False
 
     for step in range(MAX_TOOL_STEPS):
@@ -513,8 +994,38 @@ async def on_message(ctx: Context, sender: str, msg: ChatMessage):
                 except Exception as e:
                     ctx.logger.warning(f"Autofill/validation prep skipped: {e}")
 
-                # execute with retries/backoff; never raise — feed error back
-                result = await asyncio.to_thread(safe_tool_call, client, tool, params)
+                # Execute with enhanced error handling
+                call_context = {"step": step + 1, "user_query": text}
+                enhanced_result = await asyncio.to_thread(
+                    safe_tool_call_enhanced, client, tool, params, call_context
+                )
+
+                # Extract actual result and track the call
+                success = enhanced_result.get("success", False)
+                if success:
+                    result = enhanced_result["result"]
+                    error_msg = None
+                else:
+                    result = enhanced_result
+                    error_msg = enhanced_result.get("error", "Unknown error")
+
+                # Create tool call record for tracking
+                tool_record = ToolCallRecord(
+                    step=step + 1,
+                    tool_name=tool,
+                    params=params,
+                    result=result,
+                    timestamp=time.time(),
+                    success=success,
+                    error=error_msg,
+                    llm_reasoning=llm_response
+                )
+                tool_chain.add_call(tool_record)
+
+                # Log workflow if available
+                workflow = tool_chain.get_chain_summary()
+                if workflow:
+                    ctx.logger.info(f"📊 {workflow}")
 
                 # Unlock handling + instruction injection
                 if tool == "__unlock_blockchain_analysis__" and not unlocked:
@@ -526,15 +1037,20 @@ async def on_message(ctx: Context, sender: str, msg: ChatMessage):
                                 if isinstance(item, dict) and item.get("type") == "text":
                                     instruction_text += item.get("text", "")
                         if instruction_text:
-                            conversation[0]["content"] = build_system_prompt(instruction_text)
+                            system_prompt_content = build_system_prompt(instruction_text)
+                            conversation[0]["content"] = system_prompt_content
                             ctx.logger.info("📚 System prompt enhanced from unlock.")
                     except Exception as e:
                         ctx.logger.warning(f"Could not extract unlock instructions: {e}")
 
-                result_str = format_tool_result(tool, result)
+                # Use contextual formatting for tool results
+                all_records = tool_chain.get_all_records()
+                contextual_response = create_contextual_tool_response(
+                    tool, result, all_records[:-1]  # Exclude current call
+                )
                 conversation.append({
                     "role": "user",
-                    "content": f"TOOL_RESULT for {tool}:\n```json\n{result_str}\n```"
+                    "content": contextual_response
                 })
 
             else:
@@ -549,9 +1065,14 @@ async def on_message(ctx: Context, sender: str, msg: ChatMessage):
                         "role": "user",
                         "content": f"Your answer seems incomplete. Provide a full analysis in natural language and end with {FINAL_SENTINEL}"
                     })
-                    # continue loop
+                    # continue loop - apply compression if needed
                     if len(conversation) > MAX_HISTORY:
-                        conversation = [conversation[0]] + conversation[-(MAX_HISTORY - 1):]
+                        conversation = compress_conversation_history(
+                            conversation,
+                            tool_chain,
+                            max_entries=MAX_HISTORY,
+                            preserve_recent=5
+                        )
                     continue
 
                 await ctx.send(
@@ -564,9 +1085,14 @@ async def on_message(ctx: Context, sender: str, msg: ChatMessage):
                 )
                 return
 
-            # trim conversation (keep system)
+            # Intelligent conversation trimming using priority-based compression
             if len(conversation) > MAX_HISTORY:
-                conversation = [conversation[0]] + conversation[-(MAX_HISTORY - 1):]
+                conversation = compress_conversation_history(
+                    conversation,
+                    tool_chain,
+                    max_entries=MAX_HISTORY,
+                    preserve_recent=5
+                )
 
         except Exception as e:
             ctx.logger.error(f"❌ Error: {e}")
